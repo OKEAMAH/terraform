@@ -6,6 +6,7 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hcldec"
@@ -40,6 +41,8 @@ type ProviderInstance struct {
 	providerArgs perEvalPhase[promising.Once[withDiagnostics[cty.Value]]]
 	client       perEvalPhase[promising.Once[withDiagnostics[providers.Interface]]]
 }
+
+var _ ExpressionScope = (*ProviderInstance)(nil)
 
 func newProviderInstance(provider *Provider, key addrs.InstanceKey, repetition instances.RepetitionData) *ProviderInstance {
 	return &ProviderInstance{
@@ -168,26 +171,15 @@ func (p *ProviderInstance) CheckClient(ctx context.Context, phase EvalPhase) (pr
 			var diags tfdiags.Diagnostics
 
 			if p.repetition.EachKey != cty.NilVal && !p.repetition.EachKey.IsKnown() {
-				// If we're a placeholder standing in for all instances of
-				// a provider block whose for_each is unknown then we
-				// can't configure.
-				return stubs.ConfiguredProvider{Unknown: true}, diags
+				// We should have triggered and returned a stub.UnknownProvider
+				// in this case, so there's a bug somewhere in Terraform if
+				// this happens.
+				panic("provider instance with unknown for_each key")
 			}
 			if p.repetition.CountIndex != cty.NilVal && !p.repetition.CountIndex.IsKnown() {
-				// If we're a placeholder standing in for all instances of
-				// a provider block whose count is unknown then we
-				// can't configure.
-				return stubs.ConfiguredProvider{Unknown: true}, diags
-			}
-
-			args := p.ProviderArgs(ctx, phase)
-			if !args.IsKnown() {
-				// If we don't know the provider configuration at all then
-				// we'll just immediately return a stub client, since
-				// no provider can accept a wholly-unknown configuration.
-				// (Known objects with unknown attribute values inside are
-				// okay to try and so don't return immediately here.)
-				return stubs.ConfiguredProvider{Unknown: true}, diags
+				// Providers don't even support the count index argument, so
+				// something crazy is happening if we get here.
+				panic("provider instance with unknown count index")
 			}
 
 			providerType := p.ProviderType(ctx)
@@ -204,7 +196,7 @@ func (p *ProviderInstance) CheckClient(ctx context.Context, phase EvalPhase) (pr
 					),
 					Subject: decl.DeclRange.ToHCL().Ptr(),
 				})
-				return stubs.ConfiguredProvider{Unknown: false}, diags
+				return &stubs.ErroredProvider{}, diags
 			}
 
 			// If the context we recieved gets cancelled then we want providers
@@ -257,10 +249,13 @@ func (p *ProviderInstance) CheckClient(ctx context.Context, phase EvalPhase) (pr
 
 			// We unmark the config before making the RPC call, as marks cannot
 			// be serialized.
-			unmarkedArgs, _ := args.UnmarkDeep()
+			unmarkedArgs, _ := p.ProviderArgs(ctx, phase).UnmarkDeep()
 			resp := client.ConfigureProvider(providers.ConfigureProviderRequest{
 				TerraformVersion: version.SemVer.String(),
 				Config:           unmarkedArgs,
+				ClientCapabilities: providers.ClientCapabilities{
+					DeferralAllowed: true,
+				},
 			})
 			diags = diags.Append(resp.Diagnostics)
 			if resp.Diagnostics.HasErrors() {
@@ -269,7 +264,7 @@ func (p *ProviderInstance) CheckClient(ctx context.Context, phase EvalPhase) (pr
 				// stub instead. (The real provider stays running until it
 				// gets cleaned up by the cleanup function above, despite being
 				// inaccessible to the caller.)
-				return stubs.ConfiguredProvider{Unknown: false}, diags
+				return &stubs.ErroredProvider{}, diags
 			}
 
 			return providerClose{
@@ -290,6 +285,12 @@ func (p *ProviderInstance) CheckClient(ctx context.Context, phase EvalPhase) (pr
 func (p *ProviderInstance) ResolveExpressionReference(ctx context.Context, ref stackaddrs.Reference) (Referenceable, tfdiags.Diagnostics) {
 	stack := p.provider.Stack(ctx)
 	return stack.resolveExpressionReference(ctx, ref, nil, p.repetition)
+}
+
+// PlanTimestamp implements ExpressionScope, providing the timestamp at which
+// the current plan is being run.
+func (p *ProviderInstance) PlanTimestamp() time.Time {
+	return p.main.PlanTimestamp()
 }
 
 func (p *ProviderInstance) checkValid(ctx context.Context, phase EvalPhase) tfdiags.Diagnostics {

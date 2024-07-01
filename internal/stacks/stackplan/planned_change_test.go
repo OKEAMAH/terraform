@@ -272,8 +272,8 @@ func TestPlannedChangeAsProto(t *testing.T) {
 								Provider: `provider["example.com/thingers/thingy"]`,
 							},
 						},
-						Deferred: &tfstackdata1.PlanDeferredResourceInstanceChange_Deferred{
-							Reason: tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_RESOURCE_CONFIG_UNKNOWN,
+						Deferred: &planproto.Deferred{
+							Reason: planproto.DeferredReason_RESOURCE_CONFIG_UNKNOWN,
 						},
 					}),
 				},
@@ -544,6 +544,47 @@ func TestPlannedChangeAsProto(t *testing.T) {
 										Msgpack: []byte{'\x80'}, // zero-length mapping
 									},
 								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"root input variable": {
+			Receiver: &PlannedChangeRootInputValue{
+				Addr:  stackaddrs.InputVariable{Name: "thingy_id"},
+				Value: cty.StringVal("boop"),
+			},
+			Want: &terraform1.PlannedChange{
+				Raw: []*anypb.Any{
+					mustMarshalAnyPb(&tfstackdata1.PlanRootInputValue{
+						Name: "thingy_id",
+						Value: &planproto.DynamicValue{
+							Msgpack: []byte("\x92\xc4\b\"string\"\xa4boop"),
+						},
+					}),
+				},
+			},
+		},
+		"root input variable that must be re-supplied during apply": {
+			Receiver: &PlannedChangeRootInputValue{
+				Addr:            stackaddrs.InputVariable{Name: "thingy_id"},
+				RequiredOnApply: true,
+				// No value in this case: the value must be re-supplied during
+				// apply specifically so that we can avoid the need to store it.
+			},
+			Want: &terraform1.PlannedChange{
+				Raw: []*anypb.Any{
+					mustMarshalAnyPb(&tfstackdata1.PlanRootInputValue{
+						Name:            "thingy_id",
+						RequiredOnApply: true,
+					}),
+				},
+				Descriptions: []*terraform1.PlannedChange_ChangeDescription{
+					&terraform1.PlannedChange_ChangeDescription{
+						Description: &terraform1.PlannedChange_ChangeDescription_ApplyTimeInputVariable{
+							ApplyTimeInputVariable: &terraform1.PlannedChange_InputVariableDuringApply{
+								Name: "thingy_id",
 							},
 						},
 					},

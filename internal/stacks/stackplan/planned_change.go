@@ -50,8 +50,24 @@ type PlannedChange interface {
 type PlannedChangeRootInputValue struct {
 	Addr stackaddrs.InputVariable
 
-	// Value is the value we used for the variable during planning.
+	// Value is the value we used for the variable during planning, or
+	// [cty.NilVal] if the variable was declared as ephemeral and therefore
+	// its value must not be persisted between phases.
 	Value cty.Value
+
+	// RequiredOnApply is true if a non-null value for this variable
+	// must be supplied during the apply phase.
+	//
+	// If this field is false then the variable must either be left unset
+	// or must be set to the same value during the apply phase, both of
+	// which are equivalent.
+	//
+	// This is set for an input variable that was declared as ephemeral
+	// and was set to a non-null value during the planning phase. The
+	// "null-ness" of an ephemeral value is not allowed to change between
+	// plan and apply, but a value set during planning can have a different
+	// value during apply.
+	RequiredOnApply bool
 }
 
 var _ PlannedChange = (*PlannedChangeRootInputValue)(nil)
@@ -61,25 +77,46 @@ func (pc *PlannedChangeRootInputValue) PlannedChangeProto() (*terraform1.Planned
 	// We use cty.DynamicPseudoType here so that we'll save both the
 	// value _and_ its dynamic type in the plan, so we can recover
 	// exactly the same value later.
-	dv, err := plans.NewDynamicValue(pc.Value, cty.DynamicPseudoType)
-	if err != nil {
-		return nil, fmt.Errorf("can't encode value for %s: %w", pc.Addr, err)
+	var ppdv *planproto.DynamicValue
+	if pc.Value != cty.NilVal {
+		dv, err := plans.NewDynamicValue(pc.Value, cty.DynamicPseudoType)
+		if err != nil {
+			return nil, fmt.Errorf("can't encode value for %s: %w", pc.Addr, err)
+		}
+		ppdv = &planproto.DynamicValue{
+			Msgpack: dv,
+		}
 	}
 
 	var raw anypb.Any
-	err = anypb.MarshalFrom(&raw, &tfstackdata1.PlanRootInputValue{
-		Name: pc.Addr.Name,
-		Value: &planproto.DynamicValue{
-			Msgpack: dv,
-		},
+	err := anypb.MarshalFrom(&raw, &tfstackdata1.PlanRootInputValue{
+		Name:            pc.Addr.Name,
+		Value:           ppdv,
+		RequiredOnApply: pc.RequiredOnApply,
 	}, proto.MarshalOptions{})
 	if err != nil {
 		return nil, err
 	}
-	return &terraform1.PlannedChange{
-		Raw: []*anypb.Any{&raw},
 
-		// There is no external-facing description for this change type.
+	var descs []*terraform1.PlannedChange_ChangeDescription
+	if pc.RequiredOnApply {
+		// We only include a change description for the subset of variables
+		// which must be re-supplied during apply. This allows an apply-time
+		// caller to know which subset of variables it needs to provide.
+		descs = []*terraform1.PlannedChange_ChangeDescription{
+			{
+				Description: &terraform1.PlannedChange_ChangeDescription_ApplyTimeInputVariable{
+					ApplyTimeInputVariable: &terraform1.PlannedChange_InputVariableDuringApply{
+						Name: pc.Addr.Name,
+					},
+				},
+			},
+		}
+	}
+
+	return &terraform1.PlannedChange{
+		Raw:          []*anypb.Any{&raw},
+		Descriptions: descs,
 	}, nil
 }
 
@@ -406,26 +443,20 @@ func (dpc *PlannedChangeDeferredResourceInstancePlanned) PlannedChangeProto() (*
 		return nil, err
 	}
 
-	var deferred tfstackdata1.PlanDeferredResourceInstanceChange_Deferred
-	switch dpc.DeferredReason {
-	case providers.DeferredReasonInstanceCountUnknown:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_INSTANCE_COUNT_UNKNOWN
-	case providers.DeferredReasonResourceConfigUnknown:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_RESOURCE_CONFIG_UNKNOWN
-	case providers.DeferredReasonProviderConfigUnknown:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_PROVIDER_CONFIG_UNKNOWN
-	case providers.DeferredReasonAbsentPrereq:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_ABSENT_PREREQ
-	case providers.DeferredReasonDeferredPrereq:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_DEFERRED_PREREQ
-	default:
-		deferred.Reason = tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_INVALID
-	}
+	// We'll ignore the error here. We certainly should not have got this far
+	// if we have a deferred reason that the Terraform Core runtime doesn't
+	// recognise. There will be diagnostics elsewhere to reflect this, as we
+	// can just use INVALID to capture this. This also makes us forwards and
+	// backwards compatible, as we'll return INVALID for any new deferred
+	// reasons that are added in the future without erroring.
+	deferredReason, _ := planfile.DeferredReasonToProto(dpc.DeferredReason)
 
 	var raw anypb.Any
 	err = anypb.MarshalFrom(&raw, &tfstackdata1.PlanDeferredResourceInstanceChange{
-		Change:   change,
-		Deferred: &deferred,
+		Change: change,
+		Deferred: &planproto.Deferred{
+			Reason: deferredReason,
+		},
 	}, proto.MarshalOptions{})
 	if err != nil {
 		return nil, err
@@ -435,28 +466,12 @@ func (dpc *PlannedChangeDeferredResourceInstancePlanned) PlannedChangeProto() (*
 		return nil, err
 	}
 
-	var deferred2 terraform1.Deferred
-	switch dpc.DeferredReason {
-	case providers.DeferredReasonInstanceCountUnknown:
-		deferred2.Reason = terraform1.Deferred_INSTANCE_COUNT_UNKNOWN
-	case providers.DeferredReasonResourceConfigUnknown:
-		deferred2.Reason = terraform1.Deferred_RESOURCE_CONFIG_UNKNOWN
-	case providers.DeferredReasonProviderConfigUnknown:
-		deferred2.Reason = terraform1.Deferred_PROVIDER_CONFIG_UNKNOWN
-	case providers.DeferredReasonAbsentPrereq:
-		deferred2.Reason = terraform1.Deferred_ABSENT_PREREQ
-	case providers.DeferredReasonDeferredPrereq:
-		deferred2.Reason = terraform1.Deferred_DEFERRED_PREREQ
-	default:
-		deferred2.Reason = terraform1.Deferred_INVALID
-	}
-
 	var descs []*terraform1.PlannedChange_ChangeDescription
 	descs = append(descs, &terraform1.PlannedChange_ChangeDescription{
 		Description: &terraform1.PlannedChange_ChangeDescription_ResourceInstanceDeferred{
 			ResourceInstanceDeferred: &terraform1.PlannedChange_ResourceInstanceDeferred{
 				ResourceInstance: ricd.GetResourceInstancePlanned(),
-				Deferred:         &deferred2,
+				Deferred:         EncodeDeferred(dpc.DeferredReason),
 			},
 		},
 	})
@@ -465,6 +480,25 @@ func (dpc *PlannedChangeDeferredResourceInstancePlanned) PlannedChangeProto() (*
 		Raw:          []*anypb.Any{&raw},
 		Descriptions: descs,
 	}, nil
+}
+
+func EncodeDeferred(reason providers.DeferredReason) *terraform1.Deferred {
+	deferred := new(terraform1.Deferred)
+	switch reason {
+	case providers.DeferredReasonInstanceCountUnknown:
+		deferred.Reason = terraform1.Deferred_INSTANCE_COUNT_UNKNOWN
+	case providers.DeferredReasonResourceConfigUnknown:
+		deferred.Reason = terraform1.Deferred_RESOURCE_CONFIG_UNKNOWN
+	case providers.DeferredReasonProviderConfigUnknown:
+		deferred.Reason = terraform1.Deferred_PROVIDER_CONFIG_UNKNOWN
+	case providers.DeferredReasonAbsentPrereq:
+		deferred.Reason = terraform1.Deferred_ABSENT_PREREQ
+	case providers.DeferredReasonDeferredPrereq:
+		deferred.Reason = terraform1.Deferred_DEFERRED_PREREQ
+	default:
+		deferred.Reason = terraform1.Deferred_INVALID
+	}
+	return deferred
 }
 
 func encodePathSet(pathSet cty.PathSet) ([]*terraform1.AttributePath, error) {
@@ -546,6 +580,29 @@ func (pc *PlannedChangeHeader) PlannedChangeProto() (*terraform1.PlannedChange, 
 	err := anypb.MarshalFrom(&raw, &tfstackdata1.PlanHeader{
 		TerraformVersion: pc.TerraformVersion.String(),
 		PrevRunStateRaw:  pc.PrevRunStateRaw,
+	}, proto.MarshalOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return &terraform1.PlannedChange{
+		Raw: []*anypb.Any{&raw},
+	}, nil
+}
+
+// PlannedChangePlannedTimestamp is a special change type we emit to record the timestamp
+// of when the plan was generated. This is being used in the plantimestamp function.
+type PlannedChangePlannedTimestamp struct {
+	PlannedTimestamp time.Time
+}
+
+var _ PlannedChange = (*PlannedChangePlannedTimestamp)(nil)
+
+// PlannedChangeProto implements PlannedChange.
+func (pc *PlannedChangePlannedTimestamp) PlannedChangeProto() (*terraform1.PlannedChange, error) {
+	var raw anypb.Any
+	err := anypb.MarshalFrom(&raw, &tfstackdata1.PlanTimestamp{
+		PlanTimestamp: pc.PlannedTimestamp.Format(time.RFC3339),
 	}, proto.MarshalOptions{})
 	if err != nil {
 		return nil, err

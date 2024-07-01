@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/providers"
+	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	"github.com/hashicorp/terraform/internal/stacks/stackruntime/internal/stackeval"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
@@ -59,8 +60,9 @@ func Apply(ctx context.Context, req *ApplyRequest, resp *ApplyResponse) {
 		req.Config,
 		req.RawPlan,
 		stackeval.ApplyOpts{
-			ProviderFactories:  req.ProviderFactories,
-			ExperimentsAllowed: req.ExperimentsAllowed,
+			InputVariableValues: req.InputValues,
+			ProviderFactories:   req.ProviderFactories,
+			ExperimentsAllowed:  req.ExperimentsAllowed,
 		},
 		outp,
 	)
@@ -96,6 +98,7 @@ type ApplyRequest struct {
 	Config  *stackconfig.Config
 	RawPlan []*anypb.Any
 
+	InputValues       map[stackaddrs.InputVariable]ExternalInputValue
 	ProviderFactories map[addrs.Provider]providers.Factory
 
 	ExperimentsAllowed bool

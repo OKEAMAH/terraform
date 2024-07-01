@@ -52,7 +52,7 @@ type NodePlannableResourceInstance struct {
 
 	// importTarget, if populated, contains the information necessary to plan
 	// an import of this resource.
-	importTarget ImportTarget
+	importTarget cty.Value
 }
 
 var (
@@ -103,36 +103,47 @@ func (n *NodePlannableResourceInstance) dataResourceExecute(ctx EvalContext) (di
 		checkRuleSeverity = tfdiags.Warning
 	}
 
-	change, state, repeatData, planDiags := n.planDataSource(ctx, checkRuleSeverity, n.skipPlanChanges)
+	change, state, deferred, repeatData, planDiags := n.planDataSource(ctx, checkRuleSeverity, n.skipPlanChanges)
 	diags = diags.Append(planDiags)
 	if diags.HasErrors() {
 		return diags
 	}
 
-	// write the data source into both the refresh state and the
-	// working state
-	diags = diags.Append(n.writeResourceInstanceState(ctx, state, refreshState))
-	if diags.HasErrors() {
-		return diags
-	}
-	diags = diags.Append(n.writeResourceInstanceState(ctx, state, workingState))
-	if diags.HasErrors() {
-		return diags
-	}
+	deferrals := ctx.Deferrals()
+	if deferred != nil {
+		// Then this data source got deferred by the provider during planning.
+		deferrals.ReportDataSourceInstanceDeferred(addr, deferred.Reason, change)
+	} else if deferrals.ShouldDeferResourceInstanceChanges(addr, n.Dependencies) {
+		// Then this data source is deferred because a dependency is deferred.
+		deferrals.ReportDataSourceInstanceDeferred(addr, providers.DeferredReasonDeferredPrereq, change)
+	} else {
+		// Not deferred; business as usual.
 
-	diags = diags.Append(n.writeChange(ctx, change, ""))
+		// write the data source into both the refresh state and the
+		// working state
+		diags = diags.Append(n.writeResourceInstanceState(ctx, state, refreshState))
+		if diags.HasErrors() {
+			return diags
+		}
+		diags = diags.Append(n.writeResourceInstanceState(ctx, state, workingState))
+		if diags.HasErrors() {
+			return diags
+		}
 
-	// Post-conditions might block further progress. We intentionally do this
-	// _after_ writing the state/diff because we want to check against
-	// the result of the operation, and to fail on future operations
-	// until the user makes the condition succeed.
-	checkDiags := evalCheckRules(
-		addrs.ResourcePostcondition,
-		n.Config.Postconditions,
-		ctx, addr, repeatData,
-		checkRuleSeverity,
-	)
-	diags = diags.Append(checkDiags)
+		diags = diags.Append(n.writeChange(ctx, change, ""))
+
+		// Post-conditions might block further progress. We intentionally do this
+		// _after_ writing the state/diff because we want to check against
+		// the result of the operation, and to fail on future operations
+		// until the user makes the condition succeed.
+		checkDiags := evalCheckRules(
+			addrs.ResourcePostcondition,
+			n.Config.Postconditions,
+			ctx, addr, repeatData,
+			checkRuleSeverity,
+		)
+		diags = diags.Append(checkDiags)
+	}
 
 	return diags
 }
@@ -161,15 +172,56 @@ func (n *NodePlannableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		}
 	}
 
-	importing := n.importTarget.IDString != "" && !n.preDestroyRefresh
-	importId := n.importTarget.IDString
+	importing := n.importTarget != cty.NilVal && !n.preDestroyRefresh
 
 	var deferred *providers.Deferred
 
 	// If the resource is to be imported, we now ask the provider for an Import
 	// and a Refresh, and save the resulting state to instanceRefreshState.
+
 	if importing {
-		instanceRefreshState, deferred, diags = n.importState(ctx, addr, importId, provider, providerSchema)
+		if n.importTarget.IsKnown() {
+			var importDiags tfdiags.Diagnostics
+			instanceRefreshState, deferred, importDiags = n.importState(ctx, addr, n.importTarget.AsString(), provider, providerSchema)
+			diags = diags.Append(importDiags)
+		} else {
+			// Otherwise, just mark the resource as deferred without trying to
+			// import it.
+			deferred = &providers.Deferred{
+				Reason: providers.DeferredReasonResourceConfigUnknown,
+			}
+			if n.Config == nil && len(n.generateConfigPath) > 0 {
+				// Then we're supposed to be generating configuration for this
+				// resource, but we can't because the configuration is unknown.
+				//
+				// Normally, the rest of this function would just be about
+				// planning the known configuration to make sure everything we
+				// do know about it is correct, but we can't even do that here.
+				//
+				// What we'll do is write out the address as being deferred with
+				// an entirely unknown value. Then we'll skip the rest of this
+				// function. (a) We're going to panic later when it complains
+				// about having no configuration, and (b) the rest of the
+				// function isn't doing anything as there is no configuration
+				// to validate.
+
+				impliedType := providerSchema.ResourceTypes[addr.Resource.Resource.Type].Block.ImpliedType()
+				ctx.Deferrals().ReportResourceInstanceDeferred(addr, providers.DeferredReasonResourceConfigUnknown, &plans.ResourceInstanceChange{
+					Addr:         addr,
+					PrevRunAddr:  addr,
+					ProviderAddr: n.ResolvedProvider,
+					Change: plans.Change{
+						Action: plans.NoOp, // assume we'll get the config generation correct.
+						Before: cty.NullVal(impliedType),
+						After:  cty.UnknownVal(impliedType),
+						Importing: &plans.Importing{
+							ID: n.importTarget,
+						},
+					},
+				})
+				return diags
+			}
+		}
 	} else {
 		var readDiags tfdiags.Diagnostics
 		instanceRefreshState, readDiags = n.readResourceInstanceState(ctx, addr)
@@ -197,14 +249,13 @@ func (n *NodePlannableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		}
 	}
 
-	// In 0.13 we could be refreshing a resource with no config.
-	// We should be operating on managed resource, but check here to be certain
-	if n.Config == nil || n.Config.Managed == nil {
-		log.Printf("[WARN] managedResourceExecute: no Managed config value found in instance state for %q", n.Addr)
-	} else {
-		if instanceRefreshState != nil {
-			instanceRefreshState.CreateBeforeDestroy = n.Config.Managed.CreateBeforeDestroy || n.ForceCreateBeforeDestroy
-		}
+	// we may need to detect a change in CreateBeforeDestroy to ensure it's
+	// stored when we are not refreshing
+	updatedCBD := false
+	if n.Config != nil && n.Config.Managed != nil && instanceRefreshState != nil {
+		newCBD := n.Config.Managed.CreateBeforeDestroy || n.ForceCreateBeforeDestroy
+		updatedCBD = instanceRefreshState.CreateBeforeDestroy != newCBD
+		instanceRefreshState.CreateBeforeDestroy = newCBD
 	}
 
 	var refreshDeferred *providers.Deferred
@@ -238,6 +289,16 @@ func (n *NodePlannableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		if deferred == nil {
 			diags = diags.Append(n.writeResourceInstanceState(ctx, instanceRefreshState, refreshState))
 		}
+		if diags.HasErrors() {
+			return diags
+		}
+	}
+
+	if n.skipRefresh && !importing && updatedCBD {
+		// CreateBeforeDestroy must be set correctly in the state which is used
+		// to create the apply graph, so if we did not refresh the state make
+		// sure we still update any changes to CreateBeforeDestroy.
+		diags = diags.Append(n.writeResourceInstanceState(ctx, instanceRefreshState, refreshState))
 		if diags.HasErrors() {
 			return diags
 		}
@@ -295,7 +356,7 @@ func (n *NodePlannableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		}
 
 		if importing {
-			change.Importing = &plans.Importing{ID: importId}
+			change.Importing = &plans.Importing{ID: n.importTarget}
 		}
 
 		// FIXME: here we udpate the change to reflect the reason for
@@ -643,7 +704,7 @@ func (n *NodePlannableResourceInstance) importState(ctx EvalContext, addr addrs.
 			"Import returned null resource",
 			fmt.Sprintf("While attempting to import with ID %s, the provider"+
 				"returned an instance with no state.",
-				n.importTarget.IDString,
+				importId,
 			),
 		))
 

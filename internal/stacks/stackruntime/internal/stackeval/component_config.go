@@ -6,6 +6,7 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/apparentlymart/go-versions/versions"
 	"github.com/hashicorp/go-slug/sourceaddrs"
@@ -179,6 +180,16 @@ func (c *ComponentConfig) validateModuleForStacks(moduleAddr addrs.Module, modul
 	return diags
 }
 
+func (c *ComponentConfig) RootModuleVariableDecls(ctx context.Context) map[string]*configs.Variable {
+	moduleTree := c.ModuleTree(ctx)
+	if moduleTree == nil {
+		// If the module tree is invalid then we'll just assume there aren't
+		// any variables declared.
+		return nil
+	}
+	return moduleTree.Module.Variables
+}
+
 // InputsType returns an object type that the object representing the caller's
 // values for this component's input variables must conform to.
 func (c *ComponentConfig) InputsType(ctx context.Context) (cty.Type, *typeexpr.Defaults) {
@@ -220,9 +231,10 @@ func (c *ComponentConfig) CheckInputVariableValues(ctx context.Context, phase Ev
 	}
 
 	decl := c.Declaration(ctx)
+	varDecls := c.RootModuleVariableDecls(ctx)
 
 	// We don't care about the returned value, only that it has no errors.
-	_, diags := EvalComponentInputVariables(ctx, wantTy, defs, decl, phase, c)
+	_, diags := EvalComponentInputVariables(ctx, varDecls, wantTy, defs, decl, phase, c)
 	return diags
 }
 
@@ -436,6 +448,12 @@ func (c *ComponentConfig) ResolveExpressionReference(ctx context.Context, ref st
 		repetition.EachValue = cty.DynamicVal
 	}
 	return c.StackConfig(ctx).resolveExpressionReference(ctx, ref, nil, repetition)
+}
+
+// PlanTimestamp implements ExpressionScope, providing the timestamp at which
+// the current plan is being run.
+func (c *ComponentConfig) PlanTimestamp() time.Time {
+	return c.main.PlanTimestamp()
 }
 
 func (c *ComponentConfig) checkValid(ctx context.Context, phase EvalPhase) tfdiags.Diagnostics {

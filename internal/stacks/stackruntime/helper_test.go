@@ -13,8 +13,10 @@ import (
 	"github.com/hashicorp/go-slug/sourcebundle"
 	"github.com/zclconf/go-cty/cty"
 
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
@@ -70,6 +72,53 @@ func loadMainBundleConfigForTest(t *testing.T, dirName string) *stackconfig.Conf
 	t.Helper()
 	fullSourceAddr := mainBundleSourceAddrStr(dirName)
 	return loadConfigForTest(t, "./testdata/mainbundle", fullSourceAddr)
+}
+
+type expectedDiagnostic struct {
+	severity tfdiags.Severity
+	summary  string
+	detail   string
+}
+
+func expectDiagnostic(severity tfdiags.Severity, summary, detail string) expectedDiagnostic {
+	return expectedDiagnostic{
+		severity: severity,
+		summary:  summary,
+		detail:   detail,
+	}
+}
+
+func expectDiagnosticsForTest(t *testing.T, actual tfdiags.Diagnostics, expected ...expectedDiagnostic) {
+	t.Helper()
+
+	max := len(expected)
+	if len(actual) < max {
+		max = len(actual)
+	}
+
+	for ix := 0; ix < max; ix++ {
+		if ix >= len(expected) {
+			t.Errorf("unexpected diagnostic [%d]: %s - %s", ix, actual[ix].Description().Summary, actual[ix].Description().Detail)
+			continue
+		}
+
+		if ix >= len(actual) {
+			t.Errorf("missing diagnostic [%d]: %s - %s", ix, expected[ix].summary, expected[ix].detail)
+			continue
+		}
+
+		if actual[ix].Severity() != expected[ix].severity {
+			t.Errorf("diagnostic [%d] has wrong severity: %s (expected %s)", ix, actual[ix].Severity(), expected[ix].severity)
+		}
+
+		if actual[ix].Description().Summary != expected[ix].summary {
+			t.Errorf("diagnostic [%d] has wrong summary: %s (expected %s)", ix, actual[ix].Description().Summary, expected[ix].summary)
+		}
+
+		if actual[ix].Description().Detail != expected[ix].detail {
+			t.Errorf("diagnostic [%d] has wrong detail: %s (expected %s)", ix, actual[ix].Description().Detail, expected[ix].detail)
+		}
+	}
 }
 
 // reportDiagnosticsForTest creates a test log entry for every diagnostic in
@@ -153,12 +202,66 @@ func plannedChangeSortKey(change stackplan.PlannedChange) string {
 		// There should only be a single applyable marker in a plan, so we can
 		// just return a static string here.
 		return "applyable"
+	case *stackplan.PlannedChangePlannedTimestamp:
+		// There should only be a single timestamp in a plan, so we can
+		// just return a static string here.
+		return "planned-timestamp"
 	default:
 		// This is only going to happen during tests, so we can panic here.
 		panic(fmt.Errorf("unrecognized planned change type: %T", change))
 	}
 }
 
+func mustDefaultRootProvider(provider string) addrs.AbsProviderConfig {
+	return addrs.AbsProviderConfig{
+		Module:   addrs.RootModule,
+		Provider: addrs.NewDefaultProvider(provider),
+	}
+}
+
+func mustAbsResourceInstance(addr string) addrs.AbsResourceInstance {
+	ret, diags := addrs.ParseAbsResourceInstanceStr(addr)
+	if len(diags) > 0 {
+		panic(fmt.Sprintf("failed to parse resource instance address %q: %s", addr, diags))
+	}
+	return ret
+}
+
+func mustAbsResourceInstanceObject(addr string) stackaddrs.AbsResourceInstanceObject {
+	ret, diags := stackaddrs.ParseAbsResourceInstanceObjectStr(addr)
+	if len(diags) > 0 {
+		panic(fmt.Sprintf("failed to parse resource instance object address %q: %s", addr, diags))
+	}
+	return ret
+}
+
+func mustAbsResourceInstanceObjectPtr(addr string) *stackaddrs.AbsResourceInstanceObject {
+	ret := mustAbsResourceInstanceObject(addr)
+	return &ret
+}
+
+func mustAbsComponentInstance(addr string) stackaddrs.AbsComponentInstance {
+	ret, diags := stackaddrs.ParseAbsComponentInstanceStr(addr)
+	if len(diags) > 0 {
+		panic(fmt.Sprintf("failed to parse component instance address %q: %s", addr, diags))
+	}
+	return ret
+}
+
+func mustAbsComponent(addr string) stackaddrs.AbsComponent {
+	ret, diags := stackaddrs.ParseAbsComponentInstanceStr(addr)
+	if len(diags) > 0 {
+		panic(fmt.Sprintf("failed to parse component instance address %q: %s", addr, diags))
+	}
+	return stackaddrs.AbsComponent{
+		Stack: ret.Stack,
+		Item:  ret.Item.Component,
+	}
+}
+
+// mustPlanDynamicValue is a helper function that constructs a
+// plans.DynamicValue from the given cty.Value, panicking if the construction
+// fails.
 func mustPlanDynamicValue(v cty.Value) plans.DynamicValue {
 	ret, err := plans.NewDynamicValue(v, v.Type())
 	if err != nil {
@@ -167,6 +270,9 @@ func mustPlanDynamicValue(v cty.Value) plans.DynamicValue {
 	return ret
 }
 
+// mustPlanDynamicValueDynamicType is a helper function that constructs a
+// plans.DynamicValue from the given cty.Value, using cty.DynamicPseudoType as
+// the type, and panicking if the construction fails.
 func mustPlanDynamicValueDynamicType(v cty.Value) plans.DynamicValue {
 	ret, err := plans.NewDynamicValue(v, cty.DynamicPseudoType)
 	if err != nil {
@@ -175,6 +281,9 @@ func mustPlanDynamicValueDynamicType(v cty.Value) plans.DynamicValue {
 	return ret
 }
 
+// mustPlanDynamicValueSchema is a helper function that constructs a
+// plans.DynamicValue from the given cty.Value and configschema.Block, panicking
+// if the construction fails.
 func mustPlanDynamicValueSchema(v cty.Value, block *configschema.Block) plans.DynamicValue {
 	ty := block.ImpliedType()
 	ret, err := plans.NewDynamicValue(v, ty)

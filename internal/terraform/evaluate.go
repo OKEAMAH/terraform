@@ -274,18 +274,26 @@ func (d *evaluationStateData) GetInputVariable(addr addrs.InputVariable, rng tfd
 	// being liberal in what it accepts because the subsequent plan walk has
 	// more information available and so can be more conservative.
 	if d.Operation == walkValidate {
-		// Ensure variable sensitivity is captured in the validate walk
+		// We should still capture the statically-configured marks during
+		// the validate walk.
+		ret := cty.UnknownVal(config.Type)
 		if config.Sensitive {
-			return cty.UnknownVal(config.Type).Mark(marks.Sensitive), diags
+			ret = ret.Mark(marks.Sensitive)
 		}
-		return cty.UnknownVal(config.Type), diags
+		if config.Ephemeral {
+			ret = ret.Mark(marks.Ephemeral)
+		}
+		return ret, diags
 	}
 
 	val := d.Evaluator.NamedValues.GetInputVariableValue(d.ModulePath.InputVariable(addr.Name))
 
-	// Mark if sensitive
+	// Mark if sensitive and/or ephemeral
 	if config.Sensitive {
 		val = val.Mark(marks.Sensitive)
+	}
+	if config.Ephemeral {
+		val = val.Mark(marks.Ephemeral)
 	}
 
 	return val, diags
@@ -518,7 +526,7 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 	// would be nice to rework this function to rely on the ResourceInstanceKeys
 	// result for _all_ of its work, rather than continuing to duplicate a bunch
 	// of the logic we've tried to encapsulate over ther already.
-	if d.Operation == walkPlan {
+	if d.Operation == walkPlan || d.Operation == walkApply {
 		if _, _, hasUnknownKeys := d.Evaluator.Instances.ResourceInstanceKeys(addr.Absolute(moduleAddr)); hasUnknownKeys {
 			// There really isn't anything interesting we can do in this situation,
 			// because it means we have an unknown for_each/count, in which case
@@ -617,6 +625,11 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 		}
 
 		instAddr := addr.Instance(key).Absolute(d.ModulePath)
+
+		if value, ok := d.Evaluator.Deferrals.GetDeferredResourceInstanceValue(instAddr); ok {
+			instances[key] = value
+			continue
+		}
 
 		change := d.Evaluator.Changes.GetResourceInstanceChange(instAddr, addrs.NotDeposed)
 		if change != nil {

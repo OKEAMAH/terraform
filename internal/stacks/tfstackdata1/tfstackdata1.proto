@@ -61,6 +61,11 @@ message PlanApplyable {
     bool applyable = 1;
 }
 
+// Records the plan timestamp to be used for all components and the stacks language.
+message PlanTimestamp {
+    string plan_timestamp = 1;
+}
+
 // Records the value of one of the main stack's input values during planning.
 //
 // These values get fixed during the plan phase so that we can ensure that we
@@ -68,6 +73,7 @@ message PlanApplyable {
 message PlanRootInputValue {
     string name = 1;
     tfplan.DynamicValue value = 2;
+    bool required_on_apply = 3;
 }
 
 // Represents the existence of a particular component instance, and so must
@@ -201,23 +207,7 @@ message PlanResourceInstanceChangePlanned {
 // Represents a deferred change to a particular resource instance within a
 // particular component instance.
 message PlanDeferredResourceInstanceChange {
-    // Deferred contains all the metadata about a the deferral of a resource
-    // instance change.
-    message Deferred {
-        // Reason describes the reason why a resource instance change was
-        // deferred.
-        enum Reason {
-            INVALID = 0;
-            INSTANCE_COUNT_UNKNOWN = 1;
-            RESOURCE_CONFIG_UNKNOWN = 2;
-            PROVIDER_CONFIG_UNKNOWN = 3;
-            ABSENT_PREREQ = 4;
-            DEFERRED_PREREQ = 5;
-        }
-        Reason reason = 1;
-    }
-
-    Deferred deferred = 1;
+    tfplan.Deferred deferred = 1;
     PlanResourceInstanceChangePlanned change = 2;
 }
 

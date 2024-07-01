@@ -2,7 +2,7 @@ module github.com/hashicorp/terraform/internal/legacy
 
 replace github.com/hashicorp/terraform => ../..
 
-go 1.22.0
+go 1.22.4
 
 require (
 	github.com/davecgh/go-spew v1.1.1
@@ -20,7 +20,7 @@ require (
 	github.com/apparentlymart/go-versions v1.0.2 // indirect
 	github.com/hashicorp/go-slug v0.15.0 // indirect
 	github.com/hashicorp/go-version v1.6.0 // indirect
-	github.com/hashicorp/hcl/v2 v2.20.0 // indirect
+	github.com/hashicorp/hcl/v2 v2.21.0 // indirect
 	github.com/hashicorp/terraform-registry-address v0.2.3 // indirect
 	github.com/hashicorp/terraform-svchost v0.1.1 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect

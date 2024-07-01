@@ -19,6 +19,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/lang/marks"
@@ -2245,7 +2246,7 @@ resource "test_object" "a" {
 	}
 }
 
-func TestContext2Apply_noExternalReferences(t *testing.T) {
+func TestContext2Apply_pruneNoExternalReferences(t *testing.T) {
 	m := testModuleInline(t, map[string]string{
 		"main.tf": `
 resource "test_object" "a" {
@@ -2264,8 +2265,17 @@ locals {
 			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
 		},
 	})
+	addrA := mustResourceInstanceAddr("test_object.a")
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(addrA, &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"test_string":"foo"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
 
-	plan, diags := ctx.Plan(m, states.NewState(), nil)
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		Mode: plans.DestroyMode,
+	})
 	if diags.HasErrors() {
 		t.Errorf("expected no errors, but got %s", diags)
 	}
@@ -2274,16 +2284,14 @@ locals {
 	assertNoDiagnostics(t, diags)
 
 	// The local value should've been pruned from the graph because nothing
-	// refers to it.
+	// refers to it and this was a destroy run.
 	gotGraph := g.String()
 	wantGraph := `provider["registry.terraform.io/hashicorp/test"]
 provider["registry.terraform.io/hashicorp/test"] (close)
-  test_object.a
+  test_object.a (destroy)
 root
   provider["registry.terraform.io/hashicorp/test"] (close)
-test_object.a
-  test_object.a (expand)
-test_object.a (expand)
+test_object.a (destroy)
   provider["registry.terraform.io/hashicorp/test"]
 `
 	if diff := cmp.Diff(wantGraph, gotGraph); diff != "" {
@@ -2296,7 +2304,78 @@ test_object.a (expand)
 	}
 }
 
-func TestContext2Apply_withExternalReferences(t *testing.T) {
+func TestContext2Apply_pruneWithExternalReferences(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "a" {
+	test_string = "foo"
+}
+
+locals {
+  local_value = test_object.a.test_string
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	addrA := mustResourceInstanceAddr("test_object.a")
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(addrA, &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"test_string":"foo"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		Mode: plans.DestroyMode,
+		ExternalReferences: []*addrs.Reference{
+			mustReference("local.local_value"),
+		},
+	})
+	if diags.HasErrors() {
+		t.Errorf("expected no errors, but got %s", diags)
+	}
+
+	g, _, diags := ctx.applyGraph(plan, m, &ApplyOpts{}, true)
+	if diags.HasErrors() {
+		t.Errorf("expected no errors, but got %s", diags)
+	}
+
+	// The local value should remain in the graph because the external
+	// reference uses it.
+	gotGraph := g.String()
+	wantGraph := `<external ref to local.local_value>
+  local.local_value (expand)
+local.local_value (expand)
+  test_object.a (expand)
+provider["registry.terraform.io/hashicorp/test"]
+provider["registry.terraform.io/hashicorp/test"] (close)
+  test_object.a (destroy)
+  test_object.a (expand)
+root
+  <external ref to local.local_value>
+  provider["registry.terraform.io/hashicorp/test"] (close)
+test_object.a (destroy)
+  provider["registry.terraform.io/hashicorp/test"]
+test_object.a (expand)
+  provider["registry.terraform.io/hashicorp/test"]
+`
+	if diff := cmp.Diff(wantGraph, gotGraph); diff != "" {
+		t.Errorf("wrong graph\n%s", diff)
+	}
+
+	_, diags = ctx.Apply(plan, m, nil)
+	if diags.HasErrors() {
+		t.Errorf("expected no errors, but got %s", diags)
+	}
+}
+
+func TestContext2Apply_pruneNonDestroy(t *testing.T) {
 	m := testModuleInline(t, map[string]string{
 		"main.tf": `
 resource "test_object" "a" {
@@ -2318,31 +2397,24 @@ locals {
 
 	plan, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
 		Mode: plans.NormalMode,
-		ExternalReferences: []*addrs.Reference{
-			mustReference("local.local_value"),
-		},
 	})
 	if diags.HasErrors() {
 		t.Errorf("expected no errors, but got %s", diags)
 	}
 
 	g, _, diags := ctx.applyGraph(plan, m, &ApplyOpts{}, true)
-	if diags.HasErrors() {
-		t.Errorf("expected no errors, but got %s", diags)
-	}
+	assertNoDiagnostics(t, diags)
 
-	// The local value should remain in the graph because the external
-	// reference uses it.
+	// Although nothing refers to the local value, it should remain in the graph
+	// because this was NOT a destroy run and the prune transform exits early.
 	gotGraph := g.String()
-	wantGraph := `<external ref to local.local_value>
-  local.local_value (expand)
-local.local_value (expand)
+	wantGraph := `local.local_value (expand)
   test_object.a
 provider["registry.terraform.io/hashicorp/test"]
 provider["registry.terraform.io/hashicorp/test"] (close)
   test_object.a
 root
-  <external ref to local.local_value>
+  local.local_value (expand)
   provider["registry.terraform.io/hashicorp/test"] (close)
 test_object.a
   test_object.a (expand)
@@ -2350,7 +2422,7 @@ test_object.a (expand)
   provider["registry.terraform.io/hashicorp/test"]
 `
 	if diff := cmp.Diff(wantGraph, gotGraph); diff != "" {
-		t.Errorf("wrong graph\n%s", diff)
+		t.Errorf("wrong apply graph\n%s", diff)
 	}
 
 	_, diags = ctx.Apply(plan, m, nil)
@@ -2917,6 +2989,216 @@ resource "test_object" "obj" {
 	assertNoErrors(t, diags)
 }
 
+func TestContext2Apply_applyingFlag(t *testing.T) {
+	// This test is for references to the symbol "terraform.applying", which
+	// is an ephemeral value that's true during an apply phase but false in
+	// all other phases.
+
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			terraform {
+				required_providers {
+					test = {
+						source = "terraform.io/builtin/test"
+					}
+				}
+
+				# If this experimental feature becomes stablized and this test
+				# is still relevant, consider just removing this opt-in while
+				# retaining the rest.
+				experiments = [ephemeral_values]
+			}
+
+			provider "test" {
+				applying = terraform.applying
+			}
+
+			resource "test_thing" "placeholder" {
+				# This is here just to give Terraform a reason to configure
+				# the provider.
+			}
+		`,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		Provider: providers.Schema{
+			Block: &configschema.Block{
+				Attributes: map[string]*configschema.Attribute{
+					"applying": {
+						Type:     cty.Bool,
+						Required: true,
+					},
+				},
+			},
+		},
+		ResourceTypes: map[string]providers.Schema{
+			"test_thing": {
+				Block: &configschema.Block{},
+			},
+		},
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewBuiltInProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, states.NewState(), SimplePlanOpts(plans.NormalMode, testInputValuesUnset(m.Module.Variables)))
+	assertNoErrors(t, diags)
+
+	if !p.ConfigureProviderCalled {
+		t.Fatalf("ConfigureProvider was not called during planning")
+	}
+	{
+		got := p.ConfigureProviderRequest.Config
+		want := cty.ObjectVal(map[string]cty.Value{
+			"applying": cty.False, // false during the planning phase
+		})
+		if diff := cmp.Diff(want, got, ctydebug.CmpOptions); diff != "" {
+			t.Errorf("wrong provider configuration during planning\n%s", diff)
+		}
+	}
+
+	// reset the mock provider so we can check it again after apply
+	p.ConfigureProviderCalled = false
+	p.ConfigureProviderRequest = providers.ConfigureProviderRequest{}
+
+	_, diags = ctx.Apply(plan, m, &ApplyOpts{})
+	assertNoErrors(t, diags)
+
+	if !p.ConfigureProviderCalled {
+		t.Fatalf("ConfigureProvider was not called while applying")
+	}
+	{
+		got := p.ConfigureProviderRequest.Config
+		want := cty.ObjectVal(map[string]cty.Value{
+			"applying": cty.True, // now true during the apply phase
+		})
+		if diff := cmp.Diff(want, got, ctydebug.CmpOptions); diff != "" {
+			t.Errorf("wrong provider configuration while applying\n%s", diff)
+		}
+	}
+}
+
+func TestContext2Apply_applyTimeVariables(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			# If this experimental feature becomes stablized and this test
+			# is still relevant, consider just removing this opt-in while
+			# retaining the rest.
+			terraform {
+				experiments = [ephemeral_values]
+			}
+
+			variable "e" {
+				type      = string
+				default   = null
+				ephemeral = true
+			}
+
+			variable "p" {
+				type    = string
+				default = null
+			}
+		`,
+	})
+
+	t.Run("set during plan", func(t *testing.T) {
+		ctx := testContext2(t, &ContextOpts{})
+		plan, diags := ctx.Plan(
+			m, states.NewState(),
+			SimplePlanOpts(plans.NormalMode, InputValues{
+				"e": {Value: cty.StringVal("e value")},
+				"p": {Value: cty.StringVal("p value")},
+			}),
+		)
+		assertNoErrors(t, diags)
+
+		{
+			got := plan.ApplyTimeVariables
+			want := collections.NewSetCmp[string]("e")
+			if diff := cmp.Diff(want, got, collections.CmpOptions); diff != "" {
+				t.Errorf("wrong apply-time variables\n%s", diff)
+			}
+		}
+		{
+			got := plan.VariableValues
+			want := map[string]plans.DynamicValue{
+				// The following is a msgpack-encoded representation of
+				// the type and value of the variable.
+				"p": plans.DynamicValue("\x92\xc4\x08\x22string\x22\xa7p value"),
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("wrong persisted variables\n%s", diff)
+			}
+		}
+
+		_, diags = ctx.Apply(plan, m, &ApplyOpts{
+			// Intentionally not setting any variables for this first
+			// check, which should therefore fail.
+		})
+		if !diags.HasErrors() {
+			t.Fatal("apply succeeded without value for 'e'; should have failed")
+		}
+
+		_, diags = ctx.Apply(plan, m, &ApplyOpts{
+			SetVariables: InputValues{
+				"e": {Value: cty.StringVal("different e value")},
+			},
+		})
+		assertNoErrors(t, diags)
+	})
+
+	t.Run("unset during plan", func(t *testing.T) {
+		ctx := testContext2(t, &ContextOpts{})
+		plan, diags := ctx.Plan(
+			m, states.NewState(),
+			SimplePlanOpts(plans.NormalMode, InputValues{
+				"e": {Value: cty.NilVal},
+				"p": {Value: cty.StringVal("p value")},
+			}),
+		)
+		assertNoErrors(t, diags)
+
+		{
+			got := plan.ApplyTimeVariables
+			want := collections.NewSetCmp[string]( /* none */ )
+			if diff := cmp.Diff(want, got, collections.CmpOptions); diff != "" {
+				t.Errorf("wrong apply-time variables\n%s", diff)
+			}
+		}
+		{
+			got := plan.VariableValues
+			want := map[string]plans.DynamicValue{
+				// The following is a msgpack-encoded representation of
+				// the type and value of the variable.
+				"p": plans.DynamicValue("\x92\xc4\x08\x22string\x22\xa7p value"),
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("wrong persisted variables\n%s", diff)
+			}
+		}
+
+		_, diags = ctx.Apply(plan, m, &ApplyOpts{
+			SetVariables: InputValues{
+				// 'e' was unset during planning, so this is invalid because
+				// it must remain unset during apply too.
+				"e": {Value: cty.StringVal("surprising e value")},
+			},
+		})
+		if !diags.HasErrors() {
+			t.Fatal("apply succeeded with invalid new value for 'e'; should have failed")
+		}
+
+		_, diags = ctx.Apply(plan, m, &ApplyOpts{
+			// Applying with 'e' still unset should be valid.
+		})
+		assertNoErrors(t, diags)
+	})
+}
+
 func TestContext2Apply_35039(t *testing.T) {
 	m := testModuleInline(t, map[string]string{
 		"main.tf": `
@@ -2976,5 +3258,83 @@ resource "test_object" "obj" {
 	_, diags = ctx.Apply(plan, m, nil)
 	if len(diags) != 1 {
 		t.Fatalf("expected exactly one diagnostic, but got %d: %s", len(diags), diags)
+	}
+}
+
+// Using refresh=false when create_before_destroy disagrees between state and
+// config, should still destroy instance.
+func TestContext2Apply_35218(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_instance" "obj" {
+	// was created with create_before_destroy=true
+	lifecycle {
+	//	create_before_destroy=true
+	}
+	value = "replace"
+}
+`,
+	})
+
+	p := testProvider("test")
+	p.GetProviderSchemaResponse.ServerCapabilities.PlanDestroy = true
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) (resp providers.PlanResourceChangeResponse) {
+		if req.ProposedNewState.IsNull() {
+			// plan destroy
+			resp.PlannedState = req.ProposedNewState
+			return resp
+		}
+
+		obj := req.ProposedNewState.AsValueMap()
+		if obj["id"].IsNull() {
+			obj["id"] = cty.UnknownVal(cty.String)
+			resp.PlannedState = cty.ObjectVal(obj)
+			return resp
+		}
+
+		// plan to replace the configured instance
+		resp.PlannedState = cty.ObjectVal(obj)
+		resp.RequiresReplace = []cty.Path{cty.GetAttrPath("value")}
+		return resp
+	}
+
+	destroyCalled := false
+	p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+		if req.PlannedState.IsNull() {
+			destroyCalled = true
+			resp.NewState = req.PlannedState
+			return resp
+		}
+
+		obj := req.PlannedState.AsValueMap()
+		obj["id"] = cty.StringVal("new_id")
+		resp.NewState = cty.ObjectVal(obj)
+		return resp
+	}
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_instance.obj"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON:           []byte(`{"id":"old_id"}`),
+			Status:              states.ObjectReady,
+			CreateBeforeDestroy: true,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		SkipRefresh: true,
+		Mode:        plans.NormalMode,
+	})
+	assertNoErrors(t, diags)
+
+	_, diags = ctx.Apply(plan, m, nil)
+	assertNoErrors(t, diags)
+
+	if !destroyCalled {
+		t.Fatal("old instance not destroyed")
 	}
 }

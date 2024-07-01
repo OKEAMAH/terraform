@@ -16,21 +16,11 @@ import (
 type PlanOpts struct {
 	PlanningMode plans.Mode
 
-	// DeferralAllowed is the counterpart of the field of the same name on
-	// terraform.PlanOpts.
-	// TODO: We actually want stacks to always allow deferred
-	// actions, but the feature needs more time in the oven before
-	// it can be enabled without regressions.
-	DeferralAllowed bool
-
 	InputVariableValues map[stackaddrs.InputVariable]ExternalInputValue
 
 	ProviderFactories ProviderFactories
 
-	// ForcePlanTimestamp, if not nil, will force the plantimestamp function
-	// to return the given time instead of whatever real time the plan was
-	// started. This is here for unit testing only.
-	ForcePlanTimestamp *time.Time
+	PlanTimestamp time.Time
 }
 
 // Plannable is implemented by objects that can participate in planning.

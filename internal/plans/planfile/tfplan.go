@@ -13,11 +13,13 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/lang/globalref"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/planproto"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -105,7 +107,7 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 	plan.Checks = checkResults
 
 	for _, rawRC := range rawPlan.ResourceChanges {
-		change, err := resourceChangeFromTfplan(rawRC)
+		change, err := resourceChangeFromTfplan(rawRC, addrs.ParseAbsResourceInstanceStr)
 		if err != nil {
 			// errors from resourceChangeFromTfplan already include context
 			return nil, err
@@ -115,7 +117,7 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 	}
 
 	for _, rawRC := range rawPlan.ResourceDrift {
-		change, err := resourceChangeFromTfplan(rawRC)
+		change, err := resourceChangeFromTfplan(rawRC, addrs.ParseAbsResourceInstanceStr)
 		if err != nil {
 			// errors from resourceChangeFromTfplan already include context
 			return nil, err
@@ -165,6 +167,13 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 		plan.VariableValues[name] = val
 	}
 
+	if len(rawPlan.ApplyTimeVariables) != 0 {
+		plan.ApplyTimeVariables = collections.NewSetCmp[string]()
+		for _, name := range rawPlan.ApplyTimeVariables {
+			plan.ApplyTimeVariables.Add(name)
+		}
+	}
+
 	for _, hash := range rawPlan.ProviderFunctionResults {
 		plan.ProviderFunctionResults = append(plan.ProviderFunctionResults,
 			providers.FunctionHash{
@@ -201,10 +210,19 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 // This is used by the stackplan package, which includes planproto messages
 // in its own wire format while using a different overall container.
 func ResourceChangeFromProto(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
-	return resourceChangeFromTfplan(rawChange)
+	return resourceChangeFromTfplan(rawChange, addrs.ParseAbsResourceInstanceStr)
 }
 
-func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
+// DeferredResourceChangeFromProto decodes an isolated deferred resource
+// instance change from its representation as a protocol buffers message.
+//
+// This the same as ResourceChangeFromProto but internally allows for splat
+// addresses, which are not allowed outside deferred changes.
+func DeferredResourceChangeFromProto(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
+	return resourceChangeFromTfplan(rawChange, addrs.ParsePartialResourceInstanceStr)
+}
+
+func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange, parseAddr func(str string) (addrs.AbsResourceInstance, tfdiags.Diagnostics)) (*plans.ResourceInstanceChangeSrc, error) {
 	if rawChange == nil {
 		// Should never happen in practice, since protobuf can't represent
 		// a nil value in a list.
@@ -221,13 +239,13 @@ func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange) (*pla
 		return nil, fmt.Errorf("no instance address for resource instance change; perhaps this plan was created by a different version of Terraform?")
 	}
 
-	instAddr, diags := addrs.ParseAbsResourceInstanceStr(rawChange.Addr)
+	instAddr, diags := parseAddr(rawChange.Addr)
 	if diags.HasErrors() {
 		return nil, fmt.Errorf("invalid resource instance address %q: %w", rawChange.Addr, diags.Err())
 	}
 	prevRunAddr := instAddr
 	if rawChange.PrevRunAddr != "" {
-		prevRunAddr, diags = addrs.ParseAbsResourceInstanceStr(rawChange.PrevRunAddr)
+		prevRunAddr, diags = parseAddr(rawChange.PrevRunAddr)
 		if diags.HasErrors() {
 			return nil, fmt.Errorf("invalid resource instance previous run address %q: %w", rawChange.PrevRunAddr, diags.Err())
 		}
@@ -409,7 +427,8 @@ func changeFromTfplan(rawChange *planproto.Change) (*plans.ChangeSrc, error) {
 
 	if rawChange.Importing != nil {
 		ret.Importing = &plans.ImportingSrc{
-			ID: rawChange.Importing.Id,
+			ID:      rawChange.Importing.Id,
+			Unknown: rawChange.Importing.Unknown,
 		}
 	}
 	ret.GeneratedConfig = rawChange.GeneratedConfig
@@ -445,7 +464,7 @@ func deferredChangeFromTfplan(dc *planproto.DeferredResourceInstanceChange) (*pl
 		return nil, fmt.Errorf("deferred change object is absent")
 	}
 
-	change, err := resourceChangeFromTfplan(dc.Change)
+	change, err := resourceChangeFromTfplan(dc.Change, addrs.ParsePartialResourceInstanceStr)
 	if err != nil {
 		return nil, err
 	}
@@ -588,6 +607,12 @@ func writeTfplan(plan *plans.Plan, w io.Writer) error {
 
 	for name, val := range plan.VariableValues {
 		rawPlan.Variables[name] = valueToTfplan(val)
+	}
+	if plan.ApplyTimeVariables.Len() != 0 {
+		rawPlan.ApplyTimeVariables = make([]string, 0, plan.ApplyTimeVariables.Len())
+		for _, name := range plan.ApplyTimeVariables.Elems() {
+			rawPlan.ApplyTimeVariables = append(rawPlan.ApplyTimeVariables, name)
+		}
 	}
 
 	for _, hash := range plan.ProviderFunctionResults {
@@ -798,7 +823,8 @@ func changeToTfplan(change *plans.ChangeSrc) (*planproto.Change, error) {
 
 	if change.Importing != nil {
 		ret.Importing = &planproto.Importing{
-			Id: change.Importing.ID,
+			Id:      change.Importing.ID,
+			Unknown: change.Importing.Unknown,
 		}
 
 	}
@@ -918,7 +944,7 @@ func deferredChangeToTfplan(dc *plans.DeferredResourceInstanceChangeSrc) (*planp
 		return nil, err
 	}
 
-	reason, err := deferredReasonToProto(dc.DeferredReason)
+	reason, err := DeferredReasonToProto(dc.DeferredReason)
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +957,7 @@ func deferredChangeToTfplan(dc *plans.DeferredResourceInstanceChangeSrc) (*planp
 	}, nil
 }
 
-func deferredReasonToProto(reason providers.DeferredReason) (planproto.DeferredReason, error) {
+func DeferredReasonToProto(reason providers.DeferredReason) (planproto.DeferredReason, error) {
 	switch reason {
 	case providers.DeferredReasonInstanceCountUnknown:
 		return planproto.DeferredReason_INSTANCE_COUNT_UNKNOWN, nil

@@ -15,7 +15,6 @@ import (
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/planfile"
 	"github.com/hashicorp/terraform/internal/plans/planproto"
-	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
 	"github.com/hashicorp/terraform/internal/stacks/tfstackdata1"
@@ -25,8 +24,9 @@ import (
 
 func LoadFromProto(msgs []*anypb.Any) (*Plan, error) {
 	ret := &Plan{
-		RootInputValues: make(map[stackaddrs.InputVariable]cty.Value),
-		Components:      collections.NewMap[stackaddrs.AbsComponentInstance, *Component](),
+		RootInputValues:         make(map[stackaddrs.InputVariable]cty.Value),
+		ApplyTimeInputVariables: collections.NewSetCmp[stackaddrs.InputVariable](),
+		Components:              collections.NewMap[stackaddrs.AbsComponentInstance, *Component](),
 	}
 
 	foundHeader := false
@@ -56,16 +56,31 @@ func LoadFromProto(msgs []*anypb.Any) (*Plan, error) {
 		case *tfstackdata1.PlanApplyable:
 			ret.Applyable = msg.Applyable
 
+		case *tfstackdata1.PlanTimestamp:
+			err = ret.PlanTimestamp.UnmarshalText([]byte(msg.PlanTimestamp))
+			if err != nil {
+				return nil, fmt.Errorf("invalid plan timestamp %q", msg.PlanTimestamp)
+			}
+
 		case *tfstackdata1.PlanRootInputValue:
 			addr := stackaddrs.InputVariable{
 				Name: msg.Name,
 			}
-			dv := plans.DynamicValue(msg.Value.Msgpack)
-			val, err := dv.Decode(cty.DynamicPseudoType)
-			if err != nil {
-				return nil, fmt.Errorf("invalid stored value for %s: %w", addr, err)
+			if msg.Value != nil {
+				dv := plans.DynamicValue(msg.Value.Msgpack)
+				val, err := dv.Decode(cty.DynamicPseudoType)
+				if err != nil {
+					return nil, fmt.Errorf("invalid stored value for %s: %w", addr, err)
+				}
+				ret.RootInputValues[addr] = val
 			}
-			ret.RootInputValues[addr] = val
+			if msg.RequiredOnApply {
+				if msg.Value != nil {
+					// A variable can't be both persisted _and_ required on apply.
+					return nil, fmt.Errorf("plan has value for required-on-apply input variable %s", addr)
+				}
+				ret.ApplyTimeInputVariables.Add(addr)
+			}
 
 		case *tfstackdata1.PlanComponentInstance:
 			addr, diags := stackaddrs.ParseAbsComponentInstanceStr(msg.ComponentInstanceAddr)
@@ -173,31 +188,20 @@ func LoadFromProto(msgs []*anypb.Any) (*Plan, error) {
 				return nil, fmt.Errorf("missing deferred from PlanDeferredResourceInstanceChange")
 			}
 
-			c, fullAddr, providerConfigAddr, err := LoadComponentForResourceInstance(ret, msg.Change)
+			c, fullAddr, providerConfigAddr, err := LoadComponentForPartialResourceInstance(ret, msg.Change)
 			if err != nil {
 				return nil, err
 			}
 
-			riPlan, err := ValidateResourceInstanceChange(msg.Change, fullAddr, providerConfigAddr)
+			riPlan, err := ValidatePartialResourceInstanceChange(msg.Change, fullAddr, providerConfigAddr)
 			if err != nil {
 				return nil, err
 			}
 
-			var deferredReason providers.DeferredReason
-			switch msg.Deferred.Reason {
-			case tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_INSTANCE_COUNT_UNKNOWN:
-				deferredReason = providers.DeferredReasonInstanceCountUnknown
-			case tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_RESOURCE_CONFIG_UNKNOWN:
-				deferredReason = providers.DeferredReasonResourceConfigUnknown
-			case tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_PROVIDER_CONFIG_UNKNOWN:
-				deferredReason = providers.DeferredReasonProviderConfigUnknown
-			case tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_ABSENT_PREREQ:
-				deferredReason = providers.DeferredReasonAbsentPrereq
-			case tfstackdata1.PlanDeferredResourceInstanceChange_Deferred_DEFERRED_PREREQ:
-				deferredReason = providers.DeferredReasonDeferredPrereq
-			default:
-				deferredReason = providers.DeferredReasonInvalid
-			}
+			// We'll just swallow the error here. A missing deferred reason
+			// could be the only cause and we want to be forward and backward
+			// compatible. This will just render as INVALID, which is fine.
+			deferredReason, _ := planfile.DeferredReasonFromProto(msg.Deferred.Reason)
 
 			c.DeferredResourceInstanceChanges.Put(fullAddr, &plans.DeferredResourceInstanceChangeSrc{
 				ChangeSrc:      riPlan,
@@ -271,6 +275,26 @@ func ValidateResourceInstanceChange(change *tfstackdata1.PlanResourceInstanceCha
 	return riPlan, nil
 }
 
+func ValidatePartialResourceInstanceChange(change *tfstackdata1.PlanResourceInstanceChangePlanned, fullAddr addrs.AbsResourceInstanceObject, providerConfigAddr addrs.AbsProviderConfig) (*plans.ResourceInstanceChangeSrc, error) {
+	riPlan, err := planfile.DeferredResourceChangeFromProto(change.Change)
+	if err != nil {
+		return nil, fmt.Errorf("invalid resource instance change: %w", err)
+	}
+	// We currently have some redundant information in the nested
+	// "change" object due to having reused some protobuf message
+	// types from the traditional Terraform CLI planproto format.
+	// We'll make sure the redundant information is consistent
+	// here because otherwise they're likely to cause
+	// difficult-to-debug problems downstream.
+	if !riPlan.Addr.Equal(fullAddr.ResourceInstance) && riPlan.DeposedKey == fullAddr.DeposedKey {
+		return nil, fmt.Errorf("planned change has inconsistent address to its containing object")
+	}
+	if !riPlan.ProviderAddr.Equal(providerConfigAddr) {
+		return nil, fmt.Errorf("planned change has inconsistent provider configuration address to its containing object")
+	}
+	return riPlan, nil
+}
+
 func LoadComponentForResourceInstance(plan *Plan, change *tfstackdata1.PlanResourceInstanceChangePlanned) (*Component, addrs.AbsResourceInstanceObject, addrs.AbsProviderConfig, error) {
 	cAddr, diags := stackaddrs.ParseAbsComponentInstanceStr(change.ComponentInstanceAddr)
 	if diags.HasErrors() {
@@ -283,6 +307,43 @@ func LoadComponentForResourceInstance(plan *Plan, change *tfstackdata1.PlanResou
 	}
 
 	riAddr, diags := addrs.ParseAbsResourceInstanceStr(change.ResourceInstanceAddr)
+	if diags.HasErrors() {
+		return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("invalid resource instance address syntax in %q", change.ResourceInstanceAddr)
+	}
+
+	var deposedKey addrs.DeposedKey
+	if change.DeposedKey != "" {
+		var err error
+		deposedKey, err = addrs.ParseDeposedKey(change.DeposedKey)
+		if err != nil {
+			return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("invalid deposed key syntax in %q", change.DeposedKey)
+		}
+	}
+	fullAddr := addrs.AbsResourceInstanceObject{
+		ResourceInstance: riAddr,
+		DeposedKey:       deposedKey,
+	}
+
+	c, ok := plan.Components.GetOk(cAddr)
+	if !ok {
+		return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("resource instance change for unannounced component instance %s", cAddr)
+	}
+
+	return c, fullAddr, providerConfigAddr, nil
+}
+
+func LoadComponentForPartialResourceInstance(plan *Plan, change *tfstackdata1.PlanResourceInstanceChangePlanned) (*Component, addrs.AbsResourceInstanceObject, addrs.AbsProviderConfig, error) {
+	cAddr, diags := stackaddrs.ParsePartialComponentInstanceStr(change.ComponentInstanceAddr)
+	if diags.HasErrors() {
+		return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("invalid component instance address syntax in %q", change.ComponentInstanceAddr)
+	}
+
+	providerConfigAddr, diags := addrs.ParseAbsProviderConfigStr(change.ProviderConfigAddr)
+	if diags.HasErrors() {
+		return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("invalid provider configuration address syntax in %q", change.ProviderConfigAddr)
+	}
+
+	riAddr, diags := addrs.ParsePartialResourceInstanceStr(change.ResourceInstanceAddr)
 	if diags.HasErrors() {
 		return nil, addrs.AbsResourceInstanceObject{}, addrs.AbsProviderConfig{}, fmt.Errorf("invalid resource instance address syntax in %q", change.ResourceInstanceAddr)
 	}

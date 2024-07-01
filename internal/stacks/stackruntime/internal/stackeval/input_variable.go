@@ -110,22 +110,24 @@ func (v *InputVariable) CheckValue(ctx context.Context, phase EvalPhase) (cty.Va
 		func(ctx context.Context) (cty.Value, tfdiags.Diagnostics) {
 			var diags tfdiags.Diagnostics
 
+			cfg := v.Config(ctx)
+			decl := v.Declaration(ctx)
+
 			switch {
 			case v.Addr().Stack.IsRoot():
-				wantTy := v.Declaration(ctx).Type.Constraint
+				var err error
 
+				wantTy := decl.Type.Constraint
 				extVal := v.main.RootVariableValue(ctx, v.Addr().Item, phase)
 
 				// We treat a null value as equivalent to an unspecified value,
 				// and replace it with the variable's default value. This is
 				// consistent with how embedded stacks handle defaults.
 				if extVal.Value.IsNull() {
-					cfg := v.Config(ctx)
-
 					// A separate code path will validate the default value, so
 					// we don't need to do that here.
-					defVal := cfg.DefaultValue(ctx)
-					if defVal == cty.NilVal {
+					val := cfg.DefaultValue(ctx)
+					if val == cty.NilVal {
 						diags = diags.Append(&hcl.Diagnostic{
 							Severity: hcl.DiagError,
 							Summary:  "No value for required variable",
@@ -135,30 +137,56 @@ func (v *InputVariable) CheckValue(ctx context.Context, phase EvalPhase) (cty.Va
 						return cty.UnknownVal(wantTy), diags
 					}
 
-					extVal = ExternalInputValue{
-						Value:    defVal,
-						DefRange: cfg.Declaration().DeclRange,
+					// The DefaultValue method already validated the default
+					// value, and applied the defaults, so we don't need to
+					// do that again.
+
+					val, err = convert.Convert(val, wantTy)
+					if err != nil {
+						diags = diags.Append(&hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "Invalid value for root input variable",
+							Detail: fmt.Sprintf(
+								"Cannot use the given value for input variable %q: %s.",
+								v.Addr().Item.Name, err,
+							),
+						})
+						val = cfg.markValue(cty.UnknownVal(wantTy))
+						return val, diags
 					}
+
+					// TODO: check the value against any custom validation rules
+					// declared in the configuration.
+					return cfg.markValue(val), diags
 				}
 
-				val, err := convert.Convert(extVal.Value, wantTy)
-				const errSummary = "Invalid value for root input variable"
+				// Otherwise, we'll use the provided value.
+				val := extVal.Value
+
+				// First, apply any defaults that are declared in the
+				// configuration.
+				if defaults := decl.Type.Defaults; defaults != nil {
+					val = defaults.Apply(val)
+				}
+
+				// Next, convert the value to the expected type.
+				val, err = convert.Convert(val, wantTy)
 				if err != nil {
 					diags = diags.Append(&hcl.Diagnostic{
 						Severity: hcl.DiagError,
-						Summary:  errSummary,
+						Summary:  "Invalid value for root input variable",
 						Detail: fmt.Sprintf(
 							"Cannot use the given value for input variable %q: %s.",
 							v.Addr().Item.Name, err,
 						),
 					})
-					val = cty.UnknownVal(wantTy)
+					val = cfg.markValue(cty.UnknownVal(wantTy))
 					return val, diags
 				}
 
 				// TODO: check the value against any custom validation rules
 				// declared in the configuration.
-				return val, diags
+				return cfg.markValue(val), diags
 
 			default:
 				definedByCallInst := v.DefinedByStackCallInstance(ctx, phase)
@@ -168,7 +196,7 @@ func (v *InputVariable) CheckValue(ctx context.Context, phase EvalPhase) (cty.Va
 					// something's gone wrong or we are descended from a stack
 					// call whose instances aren't known yet; we'll assume
 					// the latter and return a placeholder.
-					return cty.UnknownVal(v.Declaration(ctx).Type.Constraint), diags
+					return cfg.markValue(cty.UnknownVal(v.Declaration(ctx).Type.Constraint)), diags
 				}
 
 				allVals := definedByCallInst.InputVariableValues(ctx, phase)
@@ -177,7 +205,7 @@ func (v *InputVariable) CheckValue(ctx context.Context, phase EvalPhase) (cty.Va
 				// TODO: check the value against any custom validation rules
 				// declared in the configuration.
 
-				return val, diags
+				return cfg.markValue(val), diags
 			}
 		},
 	))
@@ -213,11 +241,20 @@ func (v *InputVariable) PlanChanges(ctx context.Context) ([]stackplan.PlannedCha
 		return nil, diags
 	}
 
+	decl := v.Declaration(ctx)
 	val := v.Value(ctx, PlanPhase)
+	requiredOnApply := false
+	if decl.Ephemeral {
+		// we don't persist the value for an ephemeral variable, but we
+		// do need to remember whether it was set.
+		requiredOnApply = !val.IsNull()
+		val = cty.NilVal
+	}
 	return []stackplan.PlannedChange{
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  v.Addr().Item,
-			Value: val,
+			Addr:            v.Addr().Item,
+			Value:           val,
+			RequiredOnApply: requiredOnApply,
 		},
 	}, diags
 }
